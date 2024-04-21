@@ -3,7 +3,7 @@ import { AuthData } from './auth'
 
 export const AUTH_TOKEN_KEY = '_tabby_auth'
 export const AUTH_LOCK_KEY = '_tabby_auth_lock'
-export const AUTH_LOCK_EXP = 1000 * 10
+export const AUTH_LOCK_TIMEOUT = 1000 * 10
 
 const getAuthToken = (): AuthData | undefined => {
   if (isClientSide()) {
@@ -42,85 +42,102 @@ const isTokenExpired = (exp: number) => {
 
 class TokenManager {
   private retryQueue: Array<(success: boolean, error?: Error) => void>
+  private broadcastChannel: BroadcastChannel | null
 
   constructor() {
     this.retryQueue = []
+    this.broadcastChannel =
+      typeof window !== 'undefined' ? new BroadcastChannel(AUTH_LOCK_KEY) : null
 
-    if (typeof window !== 'undefined') {
-      window.addEventListener('storage', this.handleStorageChange)
+    this.broadcastChannel?.addEventListener('message', e =>
+      this.onRefreshCompleteReceived(e)
+    )
+  }
+
+  private notifyRefreshComplete(error?: any) {
+    this.broadcastChannel?.postMessage({
+      success: !error,
+      error
+    })
+  }
+
+  onRefreshCompleteReceived = (event: MessageEvent<any>) => {
+    if (event.data?.success) {
+      this.processQueue()
+    } else {
+      this.rejectQueue(event.data?.error)
     }
   }
 
-  private handleStorageChange = (event: StorageEvent) => {
-    try {
-      if (
-        event.key === AUTH_LOCK_KEY &&
-        event.newValue === null &&
-        this.retryQueue?.length
-      ) {
-        this.processQueue()
-      }
-    } catch (e) {}
-  }
-
-  tryGetRefreshLock() {
-    const currentLock = localStorage.getItem(AUTH_LOCK_KEY)
-    const lockTimestamp = currentLock ? parseInt(currentLock, 10) : null
-    const now = Date.now()
-    if (
-      !currentLock ||
-      (lockTimestamp && now - lockTimestamp > AUTH_LOCK_EXP)
-    ) {
-      localStorage.setItem(AUTH_LOCK_KEY, now.toString())
-      return true
-    }
-    return false
-  }
-
-  releaseRefreshLock() {
-    localStorage.removeItem(AUTH_LOCK_KEY)
-  }
-
-  enqueueRetryRequest(
-    retryCallback: (success: boolean, error?: Error) => void
-  ) {
-    this.retryQueue.push(retryCallback)
+  enqueueRetryRequest() {
+    return new Promise<void>((resolve, reject) => {
+      this.retryQueue.push((success: boolean, error?: Error) => {
+        if (!success || error) {
+          reject(error ?? 'Failed to refresh token')
+        } else {
+          resolve()
+        }
+      })
+    })
   }
 
   processQueue() {
+    if (!this.retryQueue?.length) return
+
     this.retryQueue.forEach(retryCallback => retryCallback(true))
     this.retryQueue = []
-    this.releaseRefreshLock()
   }
 
   rejectQueue(error?: Error) {
+    if (!this.retryQueue?.length) return
+
     this.retryQueue.forEach(retryCallback => retryCallback(false, error))
     this.retryQueue = []
-    this.releaseRefreshLock()
+  }
+
+  async tryGetRefreshLock() {
+    try {
+      const locks = await navigator.locks.query()
+      const refreshLock = locks.held?.some(lock => lock.name === AUTH_LOCK_KEY)
+      return !!refreshLock
+    } catch (e) {
+      return false
+    }
   }
 
   async refreshToken(doRefreshToken: () => Promise<AuthData | undefined>) {
-    if (!this.tryGetRefreshLock()) {
-      // refreshing
-      return new Promise<void>((resolve, reject) => {
-        this.enqueueRetryRequest((success: boolean, error?: Error) => {
-          if (!success || error) {
-            reject(error ?? 'Failed to refresh token')
-          } else {
-            resolve()
-          }
-        })
-      })
+    const isRefreshLocked = await this.tryGetRefreshLock()
+    if (isRefreshLocked) {
+      return this.enqueueRetryRequest()
     }
 
-    const newToken = await doRefreshToken()
-    if (newToken) {
-      await saveAuthToken(newToken)
+    const abortController = new AbortController()
+    let timeoutId = window.setTimeout(() => {
+      abortController.abort()
+    }, AUTH_LOCK_TIMEOUT)
+
+    try {
+      await navigator.locks.request(
+        AUTH_LOCK_KEY,
+        { signal: abortController.signal },
+        async () => {
+          const token = await doRefreshToken()
+          if (token) {
+            saveAuthToken(token)
+            return token
+          } else {
+            clearAuthToken()
+          }
+        }
+      )
       this.processQueue()
-    } else {
+      this.notifyRefreshComplete()
+    } catch (e) {
       this.rejectQueue()
       clearAuthToken()
-      throw new Error('Failed to refresh token')
+      this.notifyRefreshComplete(e)
+    } finally {
+      clearTimeout(timeoutId)
     }
   }
 }

@@ -31,6 +31,12 @@ export default async function authEnhancedFetch(
     })
   }
 
+  if (await tokenManagerInstance.tryGetRefreshLock()) {
+    return tokenManagerInstance.enqueueRetryRequest().then(() => {
+      return requestWithAuth(url, options)
+    })
+  }
+
   const response: Response = await currentFetcher(
     url,
     addAuthToRequest(options)
